@@ -57,7 +57,7 @@ class TextIndexRequest(BaseModel):
 
 class QueryRequest(BaseModel):
     question: str
-    mode: str = "local"
+    mode: str = "auto"
     max_hops: int = 1
 
 
