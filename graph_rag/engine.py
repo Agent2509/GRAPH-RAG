@@ -17,6 +17,7 @@ from graph_rag.llm.base import BaseLLM, BaseEmbedding
 from graph_rag.llm.groq_client import GroqLLM
 from graph_rag.llm.embeddings import FastEmbedEmbedding
 from graph_rag.chunking.chunker import TextChunker
+from graph_rag.chunking.hierarchical import HierarchicalChunker
 from graph_rag.chunking.parsers import parse_file, parse_bytes
 from graph_rag.extraction.extractor import GraphExtractor
 from graph_rag.extraction.resolver import EntityResolver
@@ -27,11 +28,13 @@ from graph_rag.clustering.communities import CommunityDetector
 from graph_rag.clustering.summarizer import CommunitySummarizer
 from graph_rag.retrieval.local_search import LocalSearch
 from graph_rag.retrieval.global_search import GlobalSearch
+from graph_rag.retrieval.router import QueryRouter
+from graph_rag.retrieval.reranker import CrossEncoderReranker
 from graph_rag.visualization.visualizer import GraphVisualizer
 
 
 class GraphRAG:
-    """End-to-end Knowledge Graph RAG orchestrator."""
+    """End-to-end Knowledge Graph RAG 2.0 orchestrator."""
 
     def __init__(
         self,
@@ -42,20 +45,22 @@ class GraphRAG:
         groq_api_key: Optional[str] = None,
         groq_model: Optional[str] = None,
     ):
-        # Initialize LLM
         if llm is not None:
             self.llm = llm
         else:
             self.llm = GroqLLM(api_key=groq_api_key, model=groq_model)
 
-        # Initialize Embedding
         if embedding_model is not None:
             self.embedding = embedding_model
         else:
             self.embedding = FastEmbedEmbedding()
 
-        # Core components
+        # Chunkers
         self.chunker = TextChunker(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+        self.hierarchical_chunker = HierarchicalChunker()
+        self.parent_map: Dict[str, str] = {}
+
+        # Extraction & Resolution
         self.extractor = GraphExtractor(self.llm)
         self.resolver = EntityResolver()
 
@@ -65,22 +70,25 @@ class GraphRAG:
         self.community_store = CommunityStore()
         self.chunks_map: Dict[str, TextChunk] = {}
 
-        # Clustering & Search
+        # Clustering, Reranking & Router
         self.community_detector = CommunityDetector()
         self.community_summarizer = CommunitySummarizer(self.llm)
+        self.router = QueryRouter(self.llm)
+        self.reranker = CrossEncoderReranker()
         self.visualizer = GraphVisualizer()
 
-        # Search interfaces (lazily instantiated after indexing)
+        # Search interfaces
         self._init_search_engines()
 
     def _init_search_engines(self) -> None:
-        """Initialize local and global search engines."""
         self.local_search = LocalSearch(
             graph_store=self.graph_store,
             vector_store=self.vector_store,
             chunks_map=self.chunks_map,
             llm=self.llm,
             embedding_model=self.embedding,
+            parent_map=self.parent_map,
+            reranker=self.reranker,
         )
         self.global_search = GlobalSearch(
             community_store=self.community_store,
@@ -94,24 +102,28 @@ class GraphRAG:
         text: str,
         doc_id: str = "doc",
         metadata: Optional[Dict[str, Any]] = None,
+        hierarchical: bool = False,
     ) -> List[TextChunk]:
-        """Chunk and stage raw text for indexing."""
-        chunks = self.chunker.chunk_text(text, doc_id=doc_id, metadata=metadata)
+        """Stage text chunks. If hierarchical=True, builds parent-child mapping."""
+        if hierarchical:
+            chunks, p_map = self.hierarchical_chunker.chunk_document(text, doc_id=doc_id)
+            self.parent_map.update(p_map)
+        else:
+            chunks = self.chunker.chunk_text(text, doc_id=doc_id, metadata=metadata)
+
         for c in chunks:
             self.chunks_map[c.id] = c
         return chunks
 
-    def add_file(self, file_path: Union[str, Path]) -> List[TextChunk]:
-        """Extract text from file and stage chunks."""
+    def add_file(self, file_path: Union[str, Path], hierarchical: bool = False) -> List[TextChunk]:
         path = Path(file_path)
         text = parse_file(path)
-        return self.add_text(text, doc_id=path.stem, metadata={"source": str(path.name)})
+        return self.add_text(text, doc_id=path.stem, metadata={"source": str(path.name)}, hierarchical=hierarchical)
 
-    def add_bytes(self, content: bytes, filename: str) -> List[TextChunk]:
-        """Parse in-memory uploaded file bytes and stage chunks."""
+    def add_bytes(self, content: bytes, filename: str, hierarchical: bool = False) -> List[TextChunk]:
         text = parse_bytes(content, filename)
         doc_id = Path(filename).stem
-        return self.add_text(text, doc_id=doc_id, metadata={"source": filename})
+        return self.add_text(text, doc_id=doc_id, metadata={"source": filename}, hierarchical=hierarchical)
 
     def build_index(
         self,
@@ -119,7 +131,6 @@ class GraphRAG:
         progress_callback: Optional[Callable[[str, float], None]] = None,
         cache_dir: Optional[str] = "./data/active_index",
     ) -> Dict[str, Any]:
-        """Run the complete Graph RAG knowledge extraction and indexing pipeline with disk checkpointing."""
         total_chunks = len(self.chunks_map)
         if total_chunks == 0:
             return {"status": "empty", "message": "No chunks available to index"}
@@ -149,7 +160,6 @@ class GraphRAG:
                 except Exception:
                     pass
 
-        # 1. Extract Entities & Relations in batches for 3x-4x speedup
         report("Extracting knowledge graph triples in multi-chunk batches...", 0.1)
         raw_entities: List[Entity] = []
         raw_relations: List[Relationship] = []
@@ -199,38 +209,36 @@ class GraphRAG:
                 raise extraction_error
             return {"status": "empty", "message": "No entities extracted"}
 
-        # 2. Entity Resolution & Deduplication
         report("Resolving and deduplicating entities & relations...", 0.55)
         resolved_entities = self.resolver.resolve_entities(raw_entities)
         resolved_relations = self.resolver.resolve_relationships(raw_relations, resolved_entities)
 
-        # 3. Populate Knowledge Graph
         report("Populating Knowledge Graph...", 0.65)
         for ent in resolved_entities.values():
             self.graph_store.add_entity(ent)
         for rel in resolved_relations:
             self.graph_store.add_relationship(rel)
 
-        # 4. Compute and index Vector Embeddings
-        report("Generating vector embeddings...", 0.75)
+        report("Generating hybrid vector & BM25 indices...", 0.75)
         processed_chunks_count = min(completed_batches * b_size, total_chunks)
         indexed_chunk_items = chunk_items[:processed_chunks_count]
         chunk_texts = [c.text for c in indexed_chunk_items]
         chunk_ids = [c.id for c in indexed_chunk_items]
-        chunk_metas = [{"item_type": "chunk", "doc_id": c.doc_id, "chunk_id": c.id} for c in indexed_chunk_items]
+        chunk_metas = [
+            {"item_type": "chunk", "doc_id": c.doc_id, "chunk_id": c.id, "text": c.text}
+            for c in indexed_chunk_items
+        ]
         chunk_vecs = self.embedding.embed_batch(chunk_texts)
         self.vector_store.add_batch(chunk_ids, chunk_vecs, chunk_metas)
 
-        # Embed entities
         ent_list = list(resolved_entities.values())
         if ent_list:
             ent_texts = [f"{e.name}: {e.description}" for e in ent_list]
             ent_ids = [f"entity_{e.name}" for e in ent_list]
-            ent_metas = [{"item_type": "entity", "name": e.name, "type": e.type} for e in ent_list]
+            ent_metas = [{"item_type": "entity", "name": e.name, "type": e.type, "text": f"{e.name}: {e.description}"} for e in ent_list]
             ent_vecs = self.embedding.embed_batch(ent_texts)
             self.vector_store.add_batch(ent_ids, ent_vecs, ent_metas)
 
-        # 5. Community Detection & Summarization
         report("Detecting hierarchical graph communities...", 0.85)
         communities = self.community_detector.detect_communities(self.graph_store)
 
@@ -244,18 +252,16 @@ class GraphRAG:
         except Exception:
             pass
 
-        # Refresh search engines with populated data
         self._init_search_engines()
-
         stats = self.get_stats()
+
         if extraction_error:
             report(f"Paused at batch {completed_batches}/{total_batches}. Graph partially indexed!", 1.0)
             return {
                 "status": "partial",
-                "message": f"Partially indexed {completed_batches}/{total_batches} batches ({stats.node_count} entities, {stats.edge_count} relations). Remaining can be resumed anytime.",
+                "message": f"Partially indexed {completed_batches}/{total_batches} batches. Resume anytime.",
                 "completed_batches": completed_batches,
                 "total_batches": total_batches,
-                "chunks_indexed": processed_chunks_count,
                 "entities_count": stats.node_count,
                 "relations_count": stats.edge_count,
                 "communities_count": stats.community_count,
@@ -263,7 +269,6 @@ class GraphRAG:
             }
 
         report("Indexing complete!", 1.0)
-
         return {
             "status": "success",
             "chunks_indexed": total_chunks,
@@ -272,9 +277,15 @@ class GraphRAG:
             "communities_count": stats.community_count,
         }
 
-    def query(self, question: str, mode: str = "local", **kwargs) -> RetrievalResult:
-        """Query the Graph RAG engine in 'local' or 'global' search mode."""
+    def query(self, question: str, mode: str = "auto", **kwargs) -> RetrievalResult:
+        """Query the Graph RAG engine. Uses Agentic Router when mode='auto'."""
         clean_mode = mode.lower().strip()
+        if clean_mode == "auto":
+            decision = self.router.route(question)
+            clean_mode = decision.mode
+            if clean_mode == "hybrid":
+                clean_mode = "local"
+
         if clean_mode == "global":
             return self.global_search.search(question, **kwargs)
         else:
@@ -288,7 +299,6 @@ class GraphRAG:
         color_by: str = "type",
         node_limit: int = 500,
     ) -> str:
-        """Render the knowledge graph as interactive HTML."""
         return self.visualizer.generate_html(
             graph_store=self.graph_store,
             highlight_nodes=highlight_nodes,
@@ -299,52 +309,42 @@ class GraphRAG:
         )
 
     def get_stats(self) -> GraphStats:
-        """Retrieve graph structural and community metrics."""
         stats = self.graph_store.get_stats()
         stats.community_count = len(self.community_store)
         return stats
 
     def save(self, directory_path: str) -> None:
-        """Persist entire indexed Graph RAG pipeline to a directory."""
         dir_p = Path(directory_path)
         dir_p.mkdir(parents=True, exist_ok=True)
-
-        # 1. Save graph
         self.graph_store.save_json(str(dir_p / "graph.json"))
-
-        # 2. Save vectors
         self.vector_store.save(str(dir_p / "vectors.json"))
-
-        # 3. Save communities
         self.community_store.save_json(str(dir_p / "communities.json"))
 
-        # 4. Save chunks
         chunks_data = [c.model_dump() for c in self.chunks_map.values()]
         with open(dir_p / "chunks.json", "w", encoding="utf-8") as f:
             json.dump(chunks_data, f, indent=2)
 
+        if self.parent_map:
+            with open(dir_p / "parent_map.json", "w", encoding="utf-8") as f:
+                json.dump(self.parent_map, f, indent=2)
+
     def load(self, directory_path: str) -> None:
-        """Load an indexed Graph RAG pipeline from a directory."""
         dir_p = Path(directory_path)
         if not dir_p.exists():
             raise FileNotFoundError(f"Directory not found: {directory_path}")
 
-        # 1. Load graph
         if (dir_p / "graph.json").exists():
             self.graph_store.load_json(str(dir_p / "graph.json"))
-
-        # 2. Load vectors
         if (dir_p / "vectors.json").exists():
             self.vector_store.load(str(dir_p / "vectors.json"))
-
-        # 3. Load communities
         if (dir_p / "communities.json").exists():
             self.community_store.load_json(str(dir_p / "communities.json"))
-
-        # 4. Load chunks
         if (dir_p / "chunks.json").exists():
             with open(dir_p / "chunks.json", "r", encoding="utf-8") as f:
                 raw_chunks = json.load(f)
             self.chunks_map = {c["id"]: TextChunk(**c) for c in raw_chunks}
+        if (dir_p / "parent_map.json").exists():
+            with open(dir_p / "parent_map.json", "r", encoding="utf-8") as f:
+                self.parent_map = json.load(f)
 
         self._init_search_engines()
