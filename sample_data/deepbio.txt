@@ -1,0 +1,3 @@
+DeepBio is a biotechnology startup based in Zurich, founded by molecular biologist Dr. Marcus Smith in 2019. DeepBio specializes in computational immunology and automated protein design.
+
+In early 2023, Dr. Marcus Smith and his research team at DeepBio engineered CureX, a synthetic peptide targeting aggressive solid tumors. Recognizing the massive synergy between artificial intelligence and biological research, NexusLabs acquired DeepBio in November 2023 for $320 million. Following the acquisition, NexusLabs deployed CortexGraph to simulate protein-protein docking interactions for CureX, accelerating its preclinical phase by over eighteen months.

@@ -1,0 +1,3 @@
+In 2021, Dr. Alice Zhao, a former machine learning professor at MIT, founded NexusLabs in Boston. NexusLabs is an artificial intelligence research organization dedicated to building neuromorphic graph neural networks.
+
+NexusLabs developed CortexGraph, an open-source graph-based reasoning framework designed to connect multi-modal unstructured data into queryable knowledge topologies. In late 2022, NexusLabs entered into a multi-year strategic partnership with ApexCloud, a premier decentralized cloud infrastructure provider. Under this agreement, ApexCloud provides NexusLabs with high-bandwidth H100 GPU clusters and distributed storage systems to train CortexGraph foundation models.

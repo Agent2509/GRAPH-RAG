@@ -1,0 +1,3 @@
+Following the acquisition of DeepBio, Dr. Alice Zhao promoted Dr. Marcus Smith to Chief Science Officer of NexusLabs. 
+
+In mid-2024, the European Medicines Agency (EMA) granted priority review status to CureX after early Phase I trials demonstrated exceptional safety and tumor regression rates in oncology patients. ApexCloud announced a dedicated medical cloud partition to securely host and process the genomic sequencing and clinical trial telemetry for CureX, complying with both HIPAA and GDPR standards. Dr. Alice Zhao announced that NexusLabs and ApexCloud would jointly open-source parts of the CortexGraph medical ontology to encourage global oncology research.
