@@ -9,7 +9,6 @@ class EntityResolver:
     """Normalizes and resolves entities and relationships across chunks."""
 
     def __init__(self):
-        # Suffixes to strip when normalizing corporate entities
         self.corporate_suffixes = [
             r"\bInc\.?\b",
             r"\bLLC\.?\b",
@@ -18,18 +17,65 @@ class EntityResolver:
             r"\bLtd\.?\b",
             r"\bCo\.?\b",
         ]
+        self.honorifics = [
+            r"\bDr\.?\b",
+            r"\bProf\.?\b",
+            r"\bMr\.?\b",
+            r"\bMrs\.?\b",
+            r"\bMs\.?\b",
+        ]
 
     def normalize_name(self, name: str) -> str:
-        """Standardize an entity name."""
         cleaned = name.strip()
-        # Remove surrounding quotes
         cleaned = re.sub(r'^["\']|["\']$', "", cleaned).strip()
-        # Remove leading "the "
         cleaned = re.sub(r"^[Tt]he\s+", "", cleaned).strip()
+
+        for honorific in self.honorifics:
+            cleaned = re.sub(rf"^{honorific}\s+", "", cleaned, flags=re.IGNORECASE).strip()
+
+        for suffix in self.corporate_suffixes:
+            cleaned = re.sub(rf",?\s+{suffix}$", "", cleaned, flags=re.IGNORECASE).strip()
+
+        cleaned = cleaned.rstrip(",.")
         return cleaned
 
+    @staticmethod
+    def merge_descriptions(desc1: str, desc2: str, max_chars: int = 600) -> str:
+        d1 = (desc1 or "").strip()
+        d2 = (desc2 or "").strip()
+        if not d1:
+            return d2[:max_chars].strip()
+        if not d2:
+            return d1[:max_chars].strip()
+        if d2.lower() in d1.lower():
+            return d1[:max_chars].strip()
+        if d1.lower() in d2.lower():
+            return d2[:max_chars].strip()
+
+        s1 = [s.strip() for s in re.split(r"(?<=[.?!])\s+", d1) if s.strip()]
+        s2 = [s.strip() for s in re.split(r"(?<=[.?!])\s+", d2) if s.strip()]
+
+        retained = list(s1)
+        for cand in s2:
+            cand_lower = cand.lower()
+            cand_words = set(re.findall(r"\w+", cand_lower))
+            if not cand_words:
+                continue
+            is_dup = False
+            for existing in retained:
+                ex_words = set(re.findall(r"\w+", existing.lower()))
+                if ex_words and len(cand_words & ex_words) / len(cand_words) > 0.70:
+                    is_dup = True
+                    break
+            if not is_dup:
+                candidate_text = " ".join(retained + [cand])
+                if len(candidate_text) <= max_chars:
+                    retained.append(cand)
+
+        merged = " ".join(retained)
+        return merged[:max_chars].strip()
+
     def resolve_entities(self, entities: List[Entity]) -> Dict[str, Entity]:
-        """Deduplicate entities by canonical normalized name."""
         resolved: Dict[str, Entity] = {}
 
         for entity in entities:
@@ -43,24 +89,18 @@ class EntityResolver:
                 resolved[lower_key] = Entity(
                     name=canonical,
                     type=entity.type,
-                    description=entity.description,
+                    description=entity.description[:600].strip(),
                     source_chunk_ids=list(set(entity.source_chunk_ids)),
                 )
             else:
                 existing = resolved[lower_key]
-                # Merge descriptions if distinct
-                if entity.description and entity.description not in existing.description:
-                    if existing.description:
-                        existing.description += f" {entity.description}"
-                    else:
-                        existing.description = entity.description
+                if entity.description:
+                    existing.description = self.merge_descriptions(existing.description, entity.description)
 
-                # Union chunk provenance
                 existing.source_chunk_ids = list(
                     set(existing.source_chunk_ids + entity.source_chunk_ids)
                 )
 
-                # Prioritize specific types over default "CONCEPT"
                 if existing.type == "CONCEPT" and entity.type != "CONCEPT":
                     existing.type = entity.type
 
@@ -71,7 +111,6 @@ class EntityResolver:
         relationships: List[Relationship],
         resolved_entities: Dict[str, Entity],
     ) -> List[Relationship]:
-        """Align relationship endpoints with canonical entities and deduplicate edges."""
         edge_map: Dict[Tuple[str, str, str], Relationship] = {}
 
         for rel in relationships:
@@ -81,7 +120,6 @@ class EntityResolver:
             src_key = src_norm.lower()
             tgt_key = tgt_norm.lower()
 
-            # Ensure both source and target exist in resolved entities
             if src_key not in resolved_entities or tgt_key not in resolved_entities:
                 continue
 
@@ -98,20 +136,17 @@ class EntityResolver:
                     source=canonical_src,
                     target=canonical_tgt,
                     relation_type=rel.relation_type,
-                    description=rel.description,
+                    description=rel.description[:400].strip(),
                     weight=rel.weight,
                     source_chunk_ids=list(set(rel.source_chunk_ids)),
                 )
             else:
                 existing_rel = edge_map[edge_key]
-                # Combine descriptions
-                if rel.description and rel.description not in existing_rel.description:
-                    if existing_rel.description:
-                        existing_rel.description += f" {rel.description}"
-                    else:
-                        existing_rel.description = rel.description
+                if rel.description:
+                    existing_rel.description = self.merge_descriptions(
+                        existing_rel.description, rel.description, max_chars=400
+                    )
 
-                # Increase weight to reflect repeated corroboration
                 existing_rel.weight += rel.weight
                 existing_rel.source_chunk_ids = list(
                     set(existing_rel.source_chunk_ids + rel.source_chunk_ids)
